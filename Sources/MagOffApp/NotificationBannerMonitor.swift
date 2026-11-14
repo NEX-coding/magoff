@@ -2,10 +2,14 @@ import AppKit
 import ApplicationServices
 import CoreGraphics
 
-/// Detects Notification Center banners.
-/// Primary path: CGWindowList polling (works with or without Accessibility).
-/// On modern macOS the banner host is a large layer≥15 window owned by 通知中心;
-/// desktop widgets under NC use huge negative layers and are ignored.
+/// Detects incoming message / notification UI.
+///
+/// Sources:
+/// 1. System Notification Center toast banners
+/// 2. QQ / WeChat (微信) in-app toast windows (often bypass NC)
+/// 3. Top-of-screen “island” pills
+///
+/// Desktop NC widgets (huge negative layers) are ignored.
 final class NotificationBannerMonitor {
     private var observer: AXObserver?
     private var observedPIDs = Set<pid_t>()
@@ -14,13 +18,15 @@ final class NotificationBannerMonitor {
     private var knownWindowIDs = Set<CGWindowID>()
     private var primed = false
     private var lastFire = Date.distantPast
-    private let cooldown: TimeInterval = 2.0
+    private let cooldown: TimeInterval = 1.5
     private(set) var isRunning = false
-    /// Fired when a notification banner host appears.
     var onBanner: (() -> Void)?
-    /// Fired when all notification banner hosts have disappeared (user dismissed / timed out).
     var onBannersCleared: (() -> Void)?
+    var onNotificationCenterOpened: (() -> Void)?
     private var hadBannerHost = false
+    private var hadNotificationCenterPanel = false
+    private(set) var hasVisibleBanner = false
+    private(set) var isNotificationCenterOpen = false
 
     private let bannerSubroles: Set<String> = [
         "AXNotificationCenterBanner",
@@ -30,11 +36,18 @@ final class NotificationBannerMonitor {
         "AXNotificationCenterAlertStack",
     ]
 
-    private let ownerNames: Set<String> = [
+    private let ncOwnerNames: Set<String> = [
         "Notification Center",
         "NotificationCentre",
         "Notification Center UI",
         "通知中心",
+        "Control Center",
+        "控制中心",
+    ]
+
+    /// Apps that often show their own toasts instead of (or in addition to) NC.
+    private let imOwnerHints: [String] = [
+        "qq", "wechat", "微信", "telegram", "slack", "discord", "钉钉", "飞书", "lark",
     ]
 
     func start() {
@@ -42,9 +55,12 @@ final class NotificationBannerMonitor {
         isRunning = true
         knownWindowIDs = currentBannerWindowIDs()
         hadBannerHost = !knownWindowIDs.isEmpty
+        hasVisibleBanner = hadBannerHost
+        isNotificationCenterOpen = isNotificationCenterPanelVisible()
+        hadNotificationCenterPanel = isNotificationCenterOpen
         primed = true
 
-        windowPollTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: true) { [weak self] _ in
+        windowPollTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
             self?.pollWindows()
         }
         if let windowPollTimer {
@@ -52,9 +68,9 @@ final class NotificationBannerMonitor {
         }
 
         if AXIsProcessTrusted() {
-            attachToNotificationCenter()
+            attachAccessibilityTargets()
             axAttachTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-                self?.attachToNotificationCenter()
+                self?.attachAccessibilityTargets()
             }
             if let axAttachTimer {
                 RunLoop.main.add(axAttachTimer, forMode: .common)
@@ -62,7 +78,7 @@ final class NotificationBannerMonitor {
         }
 
         NSLog(
-            "MagOff: banner monitor started (bannerHosts=%d, ax=%d)",
+            "MagOff: banner monitor started (hosts=%d ax=%d)",
             knownWindowIDs.count,
             AXIsProcessTrusted() ? 1 : 0
         )
@@ -107,23 +123,35 @@ final class NotificationBannerMonitor {
         }
     }
 
-    // MARK: - CGWindowList
+    // MARK: - Poll
 
     private func pollWindows() {
         let current = currentBannerWindowIDs()
         defer { knownWindowIDs = current }
         guard primed else { return }
 
+        hasVisibleBanner = !current.isEmpty
+
+        let panelOpen = isNotificationCenterPanelVisible()
+        isNotificationCenterOpen = panelOpen
+        if panelOpen && !hadNotificationCenterPanel {
+            NSLog("MagOff: Notification Center panel opened")
+            DispatchQueue.main.async { [weak self] in
+                self?.onNotificationCenterOpened?()
+            }
+        }
+        hadNotificationCenterPanel = panelOpen
+
         let newlyAppeared = current.subtracting(knownWindowIDs)
         if !newlyAppeared.isEmpty {
-            NSLog("MagOff: notification host appeared ids=%@", Array(newlyAppeared).description)
+            NSLog("MagOff: alert UI appeared ids=%@", Array(newlyAppeared).description)
             hadBannerHost = true
             fireIfNeeded()
         }
 
         if hadBannerHost && current.isEmpty {
             hadBannerHost = false
-            NSLog("MagOff: notification hosts cleared → restore")
+            NSLog("MagOff: alert UI cleared")
             DispatchQueue.main.async { [weak self] in
                 self?.onBannersCleared?()
             }
@@ -132,15 +160,61 @@ final class NotificationBannerMonitor {
         }
     }
 
-    /// Banner host windows only (not NC desktop widgets).
-    private func currentBannerWindowIDs() -> Set<CGWindowID> {
-        var ids = Set<CGWindowID>()
-
-        let ncPIDs = Set(
+    private func ncProcessIDs() -> Set<pid_t> {
+        Set(
             NSRunningApplication.runningApplications(
                 withBundleIdentifier: "com.apple.notificationcenterui"
             ).map(\.processIdentifier)
         )
+    }
+
+    private func windowSize(_ info: [String: Any]) -> (CGFloat, CGFloat) {
+        let b = info[kCGWindowBounds as String] as? [String: Any]
+        let w = b?["Width"] as? CGFloat ?? 0
+        let h = b?["Height"] as? CGFloat ?? 0
+        return (w, h)
+    }
+
+    private func windowOrigin(_ info: [String: Any]) -> (CGFloat, CGFloat) {
+        let b = info[kCGWindowBounds as String] as? [String: Any]
+        let x = b?["X"] as? CGFloat ?? 0
+        let y = b?["Y"] as? CGFloat ?? 0
+        return (x, y)
+    }
+
+    private func isNCOwner(pid: pid_t, owner: String, ncPIDs: Set<pid_t>) -> Bool {
+        ncPIDs.contains(pid) || ncOwnerNames.contains(owner)
+    }
+
+    private func isIMOwner(_ owner: String) -> Bool {
+        let low = owner.lowercased()
+        return imOwnerHints.contains { low.contains($0) || owner.contains($0) }
+    }
+
+    /// Full Notification Center list (user reading / clearing).
+    private func isNotificationCenterPanelVisible() -> Bool {
+        let ncPIDs = ncProcessIDs()
+        let screenH = NSScreen.main?.frame.height ?? 900
+        guard let list = CGWindowListCopyWindowInfo(.optionOnScreenOnly, kCGNullWindowID) as? [[String: Any]]
+        else { return false }
+
+        for info in list {
+            let pid = info[kCGWindowOwnerPID as String] as? pid_t ?? 0
+            let owner = info[kCGWindowOwnerName as String] as? String ?? ""
+            guard isNCOwner(pid: pid, owner: owner, ncPIDs: ncPIDs) else { continue }
+            let alpha = info[kCGWindowAlpha as String] as? Double ?? 1
+            guard alpha > 0.05 else { continue }
+            let (w, h) = windowSize(info)
+            // Tall sidebar — not the 360×360 desktop widgets.
+            if w >= 300 && w <= 520 && h >= screenH * 0.5 { return true }
+        }
+        return false
+    }
+
+    /// Toast / island / IM alert windows that should trigger MagSafe flash.
+    private func currentBannerWindowIDs() -> Set<CGWindowID> {
+        var ids = Set<CGWindowID>()
+        let ncPIDs = ncProcessIDs()
 
         guard let list = CGWindowListCopyWindowInfo(
             [.optionOnScreenOnly, .excludeDesktopElements],
@@ -150,33 +224,71 @@ final class NotificationBannerMonitor {
         for info in list {
             let pid = info[kCGWindowOwnerPID as String] as? pid_t ?? 0
             let owner = info[kCGWindowOwnerName as String] as? String ?? ""
-            let isNC = ncPIDs.contains(pid) || ownerNames.contains(owner)
-            guard isNC else { continue }
-
             let layer = info[kCGWindowLayer as String] as? Int ?? 0
-            // Real banners: layer 15+ host window. Widgets use ~ -2147483601.
-            guard layer >= 15 else { continue }
-
             let alpha = info[kCGWindowAlpha as String] as? Double ?? 1
             let windowID = CGWindowID(info[kCGWindowNumber as String] as? UInt32 ?? 0)
             guard windowID != 0, alpha > 0.05 else { continue }
 
-            ids.insert(windowID)
+            let (w, h) = windowSize(info)
+            let (_, y) = windowOrigin(info)
+
+            // Skip desktop widgets / huge app main windows / menu bar.
+            if layer < -1000 { continue }
+            if owner == "Window Server" || owner == "程序坞" || owner == "Dock" { continue }
+            if w > 900 || h > 700 { continue }
+
+            let nc = isNCOwner(pid: pid, owner: owner, ncPIDs: ncPIDs)
+            let im = isIMOwner(owner)
+
+            // 1) System NC toast (relaxed layer — some builds use 8–14).
+            if nc, layer >= 8, w >= 100, w <= 560, h >= 36, h <= 480 {
+                ids.insert(windowID)
+                continue
+            }
+
+            // 2) QQ / WeChat floating toast (not the main chat window).
+            if im, w >= 80, w <= 560, h >= 28, h <= 420, layer >= 0 {
+                ids.insert(windowID)
+                continue
+            }
+
+            // 3) Compact top pill from NC / IM only (avoid menu-bar false positives).
+            if (nc || im), y <= 80, w >= 48, w <= 420, h >= 18, h <= 100, layer >= 0 {
+                ids.insert(windowID)
+                continue
+            }
         }
         return ids
     }
 
-    // MARK: - Accessibility (backup)
+    // MARK: - Accessibility (NC + QQ/WeChat)
 
-    private func attachToNotificationCenter() {
+    private func attachAccessibilityTargets() {
         guard AXIsProcessTrusted() else { return }
-        let apps = NSRunningApplication.runningApplications(
-            withBundleIdentifier: "com.apple.notificationcenterui"
+        var pids = Set(
+            NSRunningApplication.runningApplications(
+                withBundleIdentifier: "com.apple.notificationcenterui"
+            ).map(\.processIdentifier)
         )
-        guard let app = apps.first, app.processIdentifier != 0 else { return }
-        let pid = app.processIdentifier
-        guard !observedPIDs.contains(pid) else { return }
+        for bid in ["com.tencent.qq", "com.tencent.xinWeChat"] {
+            for app in NSRunningApplication.runningApplications(withBundleIdentifier: bid) {
+                if app.processIdentifier != 0 { pids.insert(app.processIdentifier) }
+            }
+        }
+        // Also match localized names if bundle lookup fails.
+        for app in NSWorkspace.shared.runningApplications {
+            let name = (app.localizedName ?? "").lowercased()
+            if name == "qq" || name == "wechat" || name == "微信", app.processIdentifier != 0 {
+                pids.insert(app.processIdentifier)
+            }
+        }
 
+        for pid in pids where pid != 0 && !observedPIDs.contains(pid) {
+            attachAX(to: pid)
+        }
+    }
+
+    private func attachAX(to pid: pid_t) {
         var newObserver: AXObserver?
         let result = AXObserverCreate(pid, { _, element, _, refcon in
             guard let refcon else { return }
@@ -197,12 +309,13 @@ final class NotificationBannerMonitor {
             AXObserverAddNotification(newObserver, appElement, name as CFString, refcon)
         }
 
-        if let old = observer {
-            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(old), .defaultMode)
-        }
         CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(newObserver), .defaultMode)
-        observer = newObserver
-        observedPIDs = [pid]
+        // Keep the latest NC observer in `observer` for cleanup; IM observers stay via runloop.
+        if observer == nil {
+            observer = newObserver
+        }
+        observedPIDs.insert(pid)
+        NSLog("MagOff: AX attached pid=%d", pid)
     }
 
     private func handleAX(element: AXUIElement) {

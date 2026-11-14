@@ -42,24 +42,54 @@ public enum PrivilegedInstaller {
             && FileManager.default.fileExists(atPath: MagOffPaths.launchDaemonPlist)
     }
 
+    /// First-time (or repair) install: copies helper + LaunchDaemon. Requires admin **once**.
     public static func setMode(_ mode: MagOffPaths.Mode, helperURL: URL? = nil) throws {
         try installOrUpdate(mode: mode, helperURL: helperURL)
     }
 
+    /// Change LED mode without admin.
+    /// Writes `mode` for persistence, then nudges the helper via polled `cmd` (`set:`).
+    /// (Directory FSEvents alone are unreliable for in-place mode writes.)
     public static func writeModeOnly(_ mode: MagOffPaths.Mode) throws {
-        try installOrUpdate(mode: mode, helperURL: nil)
+        let canMode = MagOffPaths.isModeFileWritable
+        let canCmd = FileManager.default.isWritableFile(atPath: MagOffPaths.cmdFile)
+
+        if !canMode && !canCmd {
+            try relaxSupportFilePermissions()
+        }
+
+        if MagOffPaths.isModeFileWritable {
+            try MagOffPaths.writeMode(mode)
+        }
+
+        if FileManager.default.isWritableFile(atPath: MagOffPaths.cmdFile) {
+            try MagOffPaths.requestSetMode(mode)
+            return
+        }
+
+        // Last resort: mode file only (helper FSEvents / next reassert).
+        if MagOffPaths.isModeFileWritable {
+            return
+        }
+        throw MagOffPaths.FlashError.writeFailed
+    }
+
+    /// One-shot admin fix so mode/cmd are user-writable (666).
+    public static func relaxSupportFilePermissions() throws {
+        let script = """
+        set -euo pipefail
+        mkdir -p '\(MagOffPaths.supportDir)'
+        /usr/bin/touch '\(MagOffPaths.modeFile)'
+        /usr/bin/touch '\(MagOffPaths.cmdFile)'
+        /usr/sbin/chown root:wheel '\(MagOffPaths.modeFile)' '\(MagOffPaths.cmdFile)'
+        /bin/chmod 666 '\(MagOffPaths.modeFile)' '\(MagOffPaths.cmdFile)'
+        """
+        try runAdminShell(script)
     }
 
     /// Ensures the world-writable flash command file exists (admin once).
     public static func ensureCommandFile() throws {
-        let script = """
-        set -euo pipefail
-        mkdir -p '\(MagOffPaths.supportDir)'
-        /usr/bin/touch '\(MagOffPaths.cmdFile)'
-        /usr/sbin/chown root:wheel '\(MagOffPaths.cmdFile)'
-        /bin/chmod 666 '\(MagOffPaths.cmdFile)'
-        """
-        try runAdminShell(script)
+        try relaxSupportFilePermissions()
     }
 
     public static func uninstall() throws {
@@ -99,7 +129,7 @@ public enum PrivilegedInstaller {
         /usr/bin/codesign --force --sign - --identifier '\(MagOffPaths.helperLabel)' '\(MagOffPaths.helperInstallPath)'
         /usr/bin/printf '%s' '\(mode.rawValue)' > '\(MagOffPaths.modeFile)'
         /usr/sbin/chown root:wheel '\(MagOffPaths.modeFile)'
-        /bin/chmod 644 '\(MagOffPaths.modeFile)'
+        /bin/chmod 666 '\(MagOffPaths.modeFile)'
         /usr/bin/touch '\(MagOffPaths.cmdFile)'
         /usr/sbin/chown root:wheel '\(MagOffPaths.cmdFile)'
         /bin/chmod 666 '\(MagOffPaths.cmdFile)'

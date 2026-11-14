@@ -39,12 +39,14 @@ public enum MagOffPaths {
     }
 
     public enum Command: String {
-        /// ~10s green/amber flash, then hold amber until `restore`.
+        /// ~10s green/amber flash, then re-apply configured mode.
         case flash
         /// Leave unread-amber hold and re-apply configured mode.
         case restore
-        /// Flash then restore mode (for menu “测试闪灯”).
+        /// Same as flash (compat).
         case pulse
+        /// Stop blinking and keep amber until `restore` (optional unread hint).
+        case hold
     }
 
     public static func requestFlash() throws {
@@ -59,15 +61,43 @@ public enum MagOffPaths {
         try writeCommand(.pulse)
     }
 
+    public static func requestHoldAmber() throws {
+        try writeCommand(.hold)
+    }
+
+    /// User-writable mode switch (helper watches this file). No admin needed.
+    public static func writeMode(_ mode: Mode) throws {
+        guard FileManager.default.fileExists(atPath: modeFile) else {
+            throw FlashError.helperNotReady
+        }
+        try writeUTF8(mode.rawValue, toPath: modeFile)
+    }
+
+    /// Ask running helper (root) to change mode via the world-writable cmd file.
+    public static func requestSetMode(_ mode: Mode) throws {
+        guard FileManager.default.fileExists(atPath: cmdFile) else {
+            throw FlashError.helperNotReady
+        }
+        try writeUTF8("set:\(mode.rawValue)", toPath: cmdFile)
+    }
+
+    public static var isModeFileWritable: Bool {
+        FileManager.default.isWritableFile(atPath: modeFile)
+    }
+
     private static func writeCommand(_ command: Command) throws {
         guard FileManager.default.fileExists(atPath: cmdFile) else {
             throw FlashError.helperNotReady
         }
-        // Must NOT use atomically:true — temp file in root-owned dir fails for user.
-        let fd = open(cmdFile, O_WRONLY | O_TRUNC)
+        try writeUTF8(command.rawValue, toPath: cmdFile)
+    }
+
+    /// Must NOT use atomically:true — temp file in root-owned dir fails for user.
+    private static func writeUTF8(_ text: String, toPath path: String) throws {
+        let fd = open(path, O_WRONLY | O_TRUNC)
         guard fd >= 0 else { throw FlashError.writeFailed }
         defer { close(fd) }
-        let data = Array(command.rawValue.utf8)
+        let data = Array(text.utf8)
         let written = data.withUnsafeBytes { raw in
             write(fd, raw.baseAddress, data.count)
         }
@@ -84,7 +114,7 @@ public enum MagOffPaths {
             case .helperNotReady:
                 return "请先选择一个灯光模式，安装后台服务后再试闪灯"
             case .writeFailed:
-                return "无法触发闪灯（命令文件不可写，可重新安装后台服务）"
+                return "无法写入（模式/命令文件不可写）。可在菜单重新选一次模式以修复权限。"
             }
         }
     }

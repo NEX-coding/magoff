@@ -22,7 +22,7 @@ mkdir -p "$SUPPORT"
 /usr/bin/codesign --force --sign - --identifier com.nex.magoff.helper "$DEST" >/dev/null
 /usr/bin/printf 'off' > "$SUPPORT/mode"
 /usr/sbin/chown root:wheel "$SUPPORT/mode"
-/bin/chmod 644 "$SUPPORT/mode"
+/bin/chmod 666 "$SUPPORT/mode"
 /usr/bin/touch "$SUPPORT/cmd"
 /usr/sbin/chown root:wheel "$SUPPORT/cmd"
 /bin/chmod 666 "$SUPPORT/cmd"
@@ -64,7 +64,7 @@ launchctl print system/com.nex.magoff.helper 2>&1 | rg 'pid =|state = running|pr
 echo "probe:"; "$DEST" --probe
 
 read_byte() {
-  /tmp/read_aclc 2>/dev/null | sed -n 's/.*byte=\([0-9]*\).*/\1/p' | tail -1
+  "$HELPER" --status 2>/dev/null | sed -n 's/.*byte=\([0-9]*\).*/\1/p' | tail -1
 }
 
 echo "==> Baseline ACLC: $(read_byte)"

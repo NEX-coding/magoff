@@ -21,6 +21,17 @@ if CommandLine.arguments.contains("--probe") {
     }
 }
 
+// Read-only diagnostic used by the portable repair/verification script.
+if CommandLine.arguments.contains("--status") {
+    do {
+        print("ACLC byte=\(try SMC.readByte(MagSafeLED.key))")
+        exit(0)
+    } catch {
+        fputs("status failed: \(error)\n", stderr)
+        exit(1)
+    }
+}
+
 if CommandLine.arguments.contains("--off") {
     do {
         try MagSafeLED.set(.off)
@@ -146,17 +157,21 @@ final class Helper {
             atPath: MagOffPaths.supportDir,
             withIntermediateDirectories: true
         )
-        if !FileManager.default.fileExists(atPath: MagOffPaths.cmdFile) {
-            FileManager.default.createFile(
-                atPath: MagOffPaths.cmdFile,
-                contents: Data(),
-                attributes: [.posixPermissions: 0o666]
+        for path in [MagOffPaths.cmdFile, MagOffPaths.modeFile] {
+            if !FileManager.default.fileExists(atPath: path) {
+                FileManager.default.createFile(
+                    atPath: path,
+                    contents: path == MagOffPaths.modeFile
+                        ? Data(MagOffPaths.Mode.system.rawValue.utf8)
+                        : Data(),
+                    attributes: [.posixPermissions: 0o666]
+                )
+            }
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o666],
+                ofItemAtPath: path
             )
         }
-        try? FileManager.default.setAttributes(
-            [.posixPermissions: 0o666],
-            ofItemAtPath: MagOffPaths.cmdFile
-        )
     }
 
     private func applyCurrentMode(reason: String, force: Bool = false) {
@@ -192,13 +207,46 @@ final class Helper {
 
         clearCmdFile()
 
+        if raw.hasPrefix("set:") {
+            let name = String(raw.dropFirst(4))
+            guard let mode = MagOffPaths.Mode(rawValue: name) else {
+                log.error("unknown set mode: \(raw, privacy: .public)")
+                return
+            }
+            // Root can rewrite mode even when file is 644; also relax perms for the app.
+            if let data = mode.rawValue.data(using: .utf8) {
+                try? data.write(to: URL(fileURLWithPath: MagOffPaths.modeFile), options: .atomic)
+            }
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o666],
+                ofItemAtPath: MagOffPaths.modeFile
+            )
+            lastModeRaw = mode.rawValue
+            flashStopRequested = true
+            flashWorkItem?.cancel()
+            holdingUnreadAmber = false
+            isFlashing = false
+            applyCurrentMode(reason: "set-cmd", force: true)
+            log.info("mode set via cmd: \(mode.rawValue, privacy: .public)")
+            return
+        }
+
         switch MagOffPaths.Command(rawValue: raw) {
         case .flash:
-            startFlash(holdAmberAfter: true)
+            // Flash then return to configured mode. Amber "unread hold" is opt-in via `hold`.
+            startFlash(holdAmberAfter: false)
         case .pulse:
             startFlash(holdAmberAfter: false)
+        case .hold:
+            // Banner auto-timeout (unread). Stop blink, keep amber until user handles it.
+            holdingUnreadAmber = true
+            flashStopRequested = true
+            flashWorkItem?.cancel()
+            isFlashing = false
+            applyCurrentMode(reason: "hold-amber", force: true)
+            log.info("hold: flash stopped, amber kept")
         case .restore:
-            // Stop mid-flash immediately — do not keep blinking after user handled it.
+            // Explicit clear (mode menu / GPT focus / 「恢复设定」).
             flashStopRequested = true
             flashWorkItem?.cancel()
             holdingUnreadAmber = false
@@ -234,17 +282,27 @@ final class Helper {
                     || (self.flashWorkItem?.isCancelled == true)
                 self.isFlashing = false
                 if aborted {
-                    // restore already reapplied mode; don't enter amber hold.
-                    log.info("flash aborted early")
+                    // `hold` may have already requested unread amber — don't wipe it.
+                    if self.holdingUnreadAmber {
+                        self.applyCurrentMode(reason: "flash-aborted-keep-amber", force: true)
+                        log.info("flash aborted → keep amber hold")
+                    } else {
+                        self.applyCurrentMode(reason: "flash-aborted", force: true)
+                        log.info("flash aborted → reapply mode")
+                    }
                     return
                 }
                 if holdAmberAfter {
                     self.holdingUnreadAmber = true
-                    self.applyCurrentMode(reason: "flash-hold-amber")
+                    self.applyCurrentMode(reason: "flash-hold-amber", force: true)
+                } else if self.holdingUnreadAmber {
+                    self.applyCurrentMode(reason: "flash-done-keep-amber", force: true)
                 } else {
-                    self.holdingUnreadAmber = false
-                    self.applyCurrentMode(reason: "pulse-done")
+                    self.applyCurrentMode(reason: "flash-done", force: true)
                 }
+                log.info(
+                    "flash done hold=\(self.holdingUnreadAmber) mode=\(MagOffPaths.Mode.load().rawValue, privacy: .public)"
+                )
             }
         }
         flashWorkItem = work
@@ -255,9 +313,12 @@ final class Helper {
         let raw = MagOffPaths.Mode.load().rawValue
         guard raw != lastModeRaw else { return }
         lastModeRaw = raw
-        guard !isFlashing else { return }
+        // Mode change always wins over an in-progress flash / amber hold.
+        flashStopRequested = true
+        flashWorkItem?.cancel()
+        isFlashing = false
         holdingUnreadAmber = false
-        applyCurrentMode(reason: "mode-file-change")
+        applyCurrentMode(reason: "mode-file-change", force: true)
     }
 
     private func watchPowerSource() {
@@ -326,6 +387,7 @@ final class Helper {
         timer.schedule(deadline: .now() + 0.2, repeating: 0.25)
         timer.setEventHandler { [weak self] in
             self?.handleCommandFile()
+            self?.checkModeFileChange()
         }
         cmdPollTimer = timer
         timer.resume()

@@ -18,9 +18,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var menu: NSMenu!
     private var supported = false
     private let bannerMonitor = NotificationBannerMonitor()
+    /// Primary detector on modern macOS (banners are not separate CGWindows).
+    private let logMonitor = NotificationLogMonitor()
     private let codexWatcher = CodexSessionWatcher()
     /// True while a GPT/Codex reply flash is active (stop when that app is focused).
     private var gptFlashActive = false
+    /// True after a system-notification flash until amber is cleared.
+    private var ncUnreadActive = false
+    /// Last time the user brought an app to the front (used to detect notification clicks).
+    private var lastAppActivationAt = Date.distantPast
+    private var lastNCFlashAt = Date.distantPast
+    private var lastBannerClearedAt = Date.distantPast
+    private var pendingClearWork: DispatchWorkItem?
+    private var stuckAmberWatch: Timer?
 
     private let gptAppBundleIDs: Set<String> = [
         "com.openai.codex", // ChatGPT.app on this Mac
@@ -41,6 +51,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshStatusItemImage()
         configureWatchers()
         observeAppActivation()
+        startStuckAmberWatch()
+        // Helper may still be holding amber from a previous session — clear it.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.triggerRestore()
+        }
+    }
+
+    /// If LED is amber but user mode isn't amber and we're not in an active
+    /// unread/GPT flash, force restore (fixes stuck orange after dismiss).
+    private func startStuckAmberWatch() {
+        stuckAmberWatch?.invalidate()
+        stuckAmberWatch = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            guard Preferences.flashOnNotification || Preferences.flashOnGPTReply else { return }
+            guard !self.ncUnreadActive, !self.gptFlashActive else { return }
+            guard MagOffPaths.Mode.load() != .amber else { return }
+            guard MagSafeLED.current() == .amber else { return }
+            // Allow a short grace after flash start.
+            guard Date().timeIntervalSince(self.lastNCFlashAt) > 12 else { return }
+            NSLog("MagOff: stuck amber detected → restore")
+            self.triggerRestore()
+        }
+        if let stuckAmberWatch {
+            RunLoop.main.add(stuckAmberWatch, forMode: .common)
+        }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -49,24 +84,83 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func configureWatchers() {
-        bannerMonitor.onBanner = { [weak self] in
+        let onBanner: () -> Void = { [weak self] in
+            guard let self else { return }
             guard Preferences.flashOnNotification else { return }
-            NSLog("MagOff: NC banner → flash")
-            self?.gptFlashActive = false
-            self?.triggerFlash()
+            // Debounce window+log dual detectors.
+            let now = Date()
+            guard now.timeIntervalSince(self.lastNCFlashAt) > 1.2 else { return }
+            self.lastNCFlashAt = now
+            NSLog("MagOff: notification → flash")
+            self.gptFlashActive = false
+            self.ncUnreadActive = true
+            self.triggerFlash()
         }
-        bannerMonitor.onBannersCleared = { [weak self] in
+        /// Banner timed out unread → stop blink, keep amber.
+        let onExpired: () -> Void = { [weak self] in
+            guard let self else { return }
             guard Preferences.flashOnNotification else { return }
-            // Only restore for general NC flash; GPT flash stops on app focus.
-            guard self?.gptFlashActive != true else { return }
-            self?.triggerRestore()
+            guard !self.gptFlashActive else { return }
+            guard self.ncUnreadActive else { return }
+            self.lastBannerClearedAt = Date()
+            self.pendingClearWork?.cancel()
+            // Wait briefly: a click often arrives as app-activation just after dismiss.
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.ncUnreadActive, !self.gptFlashActive else { return }
+                if Date().timeIntervalSince(self.lastAppActivationAt) < 1.2 {
+                    NSLog("MagOff: expired but app focused → clear amber")
+                    self.ncUnreadActive = false
+                    self.triggerRestore()
+                    return
+                }
+                // Stop flash first, then hold. A hold issued mid-flash races the
+                // helper's abort path and can reapply mode (灯灭) on older helpers.
+                NSLog("MagOff: banner auto-expired → restore then hold amber")
+                self.triggerRestore()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                    guard let self, self.ncUnreadActive, !self.gptFlashActive else { return }
+                    if Date().timeIntervalSince(self.lastAppActivationAt) < 1.2 {
+                        self.ncUnreadActive = false
+                        self.triggerRestore()
+                        return
+                    }
+                    self.triggerHoldAmber()
+                }
+            }
+            self.pendingClearWork = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.55, execute: work)
+        }
+
+        /// User opened / cleared the notification → light off.
+        let onHandled: () -> Void = { [weak self] in
+            guard let self else { return }
+            guard Preferences.flashOnNotification else { return }
+            guard !self.gptFlashActive else { return }
+            self.lastBannerClearedAt = Date()
+            self.pendingClearWork?.cancel()
+            NSLog("MagOff: notification handled → clear amber")
+            self.ncUnreadActive = false
+            self.triggerRestore()
+        }
+
+        bannerMonitor.onBanner = onBanner
+        // Window detector can't tell timeout vs click — use the delayed expire logic.
+        bannerMonitor.onBannersCleared = onExpired
+        logMonitor.onBanner = onBanner
+        logMonitor.onBannerExpired = onExpired
+        logMonitor.onBannerHandled = onHandled
+
+        bannerMonitor.onNotificationCenterOpened = { [weak self] in
+            guard let self else { return }
+            guard Preferences.flashOnNotification, self.ncUnreadActive else { return }
+            NSLog("MagOff: Notification Center opened → clear amber")
+            self.pendingClearWork?.cancel()
+            self.ncUnreadActive = false
+            self.triggerRestore()
         }
 
         codexWatcher.onTaskComplete = { [weak self] in
             guard Preferences.flashOnGPTReply else { return }
-            // Only skip when ChatGPT/Codex chat is already frontmost.
-            // Cursor stays a "stop when switched to" target, but must NOT suppress
-            // flashes for ChatGPT replies while you're working in Cursor.
             if self?.isChatGPTFrontmost() == true {
                 NSLog("MagOff: ChatGPT already focused → skip flash")
                 return
@@ -81,9 +175,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func updateWatchersRunning() {
         if Preferences.flashOnNotification {
+            if !NotificationBannerMonitor.isTrusted {
+                NotificationBannerMonitor.requestAccessibilityPermission()
+            }
             if !bannerMonitor.isRunning { bannerMonitor.start() }
+            if !logMonitor.isRunning { logMonitor.start() }
         } else {
             bannerMonitor.stop()
+            logMonitor.stop()
         }
 
         if Preferences.flashOnGPTReply {
@@ -125,13 +224,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             queue: .main
         ) { [weak self] note in
             guard let self else { return }
-            guard Preferences.flashOnGPTReply, self.gptFlashActive else { return }
             guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication
             else { return }
-            guard self.isReplyAttentionApp(app) else { return }
-            NSLog("MagOff: switched to %@ → stop GPT flash", app.localizedName ?? "")
-            self.gptFlashActive = false
-            self.triggerRestore()
+
+            // Ignore our own menu-bar process.
+            if app.bundleIdentifier == MagOffPaths.bundleID { return }
+
+            self.lastAppActivationAt = Date()
+
+            if Preferences.flashOnGPTReply, self.gptFlashActive, self.isReplyAttentionApp(app) {
+                NSLog("MagOff: switched to %@ → stop GPT flash", app.localizedName ?? "")
+                self.gptFlashActive = false
+                self.ncUnreadActive = false
+                self.triggerRestore()
+                return
+            }
+
+            // User tapped a notification: banner often disappears *before* activation.
+            if Preferences.flashOnNotification, self.ncUnreadActive {
+                let bannerUp = self.bannerMonitor.hasVisibleBanner
+                let justCleared = Date().timeIntervalSince(self.lastBannerClearedAt) < 2.5
+                // Also: within a short window after the flash, focusing an app = opened it.
+                let recentFlash = Date().timeIntervalSince(self.lastNCFlashAt) < 45
+                if bannerUp || justCleared || recentFlash {
+                    NSLog("MagOff: app %@ focused → clear unread amber", app.localizedName ?? "")
+                    self.pendingClearWork?.cancel()
+                    self.ncUnreadActive = false
+                    self.triggerRestore()
+                }
+            }
         }
     }
 
@@ -140,6 +261,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try MagOffPaths.requestFlash()
         } catch {
             NSLog("MagOff flash failed: \(error)")
+        }
+    }
+
+    private func triggerHoldAmber() {
+        do {
+            try MagOffPaths.requestHoldAmber()
+        } catch {
+            NSLog("MagOff hold failed: \(error)")
         }
     }
 
@@ -241,13 +370,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(flashToggle)
 
         let testFlash = NSMenuItem(
-            title: "测试闪灯",
+            title: "测试闪灯（结束后恢复设定）",
             action: #selector(testFlash(_:)),
             keyEquivalent: ""
         )
         testFlash.target = self
         testFlash.isEnabled = supported && helperOn
         menu.addItem(testFlash)
+
+        let clearAmber = NSMenuItem(
+            title: "恢复设定模式（取消橙灯保持）",
+            action: #selector(clearUnreadAmber(_:)),
+            keyEquivalent: ""
+        )
+        clearAmber.target = self
+        clearAmber.isEnabled = supported && helperOn
+        menu.addItem(clearAmber)
 
         if Preferences.flashOnGPTReply {
             let listen = NSMenuItem(
@@ -286,6 +424,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             nc.isEnabled = false
             menu.addItem(nc)
 
+            let ncHint = NSMenuItem(
+                title: "自动消失→保持橙 · 点开/清掉→灭灯",
+                action: nil,
+                keyEquivalent: ""
+            )
+            ncHint.isEnabled = false
+            menu.addItem(ncHint)
+
+            let qqHint = NSMenuItem(
+                title: logMonitor.isRunning
+                    ? "系统横幅日志监听：工作中"
+                    : "系统横幅日志监听：未启动",
+                action: nil,
+                keyEquivalent: ""
+            )
+            qqHint.isEnabled = false
+            menu.addItem(qqHint)
+
             let ax = NSMenuItem(
                 title: NotificationBannerMonitor.isTrusted
                     ? "辅助功能：已授权"
@@ -317,7 +473,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(status)
 
         let note = NSMenuItem(
-            title: "插拔充电器后会自动再关一次",
+            title: helperOn
+                ? "换模式无需密码 · 插拔线会自动再关"
+                : "首次选模式需一次管理员密码",
             action: nil,
             keyEquivalent: ""
         )
@@ -369,10 +527,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         关掉 MagSafe 充电器上夜里晃眼的那颗灯。
 
         · 只改指示灯显示，不影响充电 / 电池 / 键盘背光
+        · 首次安装后台服务要一次管理员密码，之后换模式不用再输
         · 可选：GPT 回复或系统通知时绿橙交叉闪
         · 需要带指示灯的 MagSafe 线 + Apple Silicon MacBook
-
-        分享给室友 / 同学前，先自己测一遍「关闭指示灯」。
         """
         alert.alertStyle = .informational
         alert.addButton(withTitle: "好")
@@ -405,6 +562,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 try PrivilegedInstaller.setMode(mode)
             }
             gptFlashActive = false
+            ncUnreadActive = false
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
                 self?.rebuildMenu()
                 self?.refreshStatusItemImage()
@@ -438,10 +596,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             if !FileManager.default.isWritableFile(atPath: MagOffPaths.cmdFile) {
                 try PrivilegedInstaller.ensureCommandFile()
             }
-            try MagOffPaths.requestPulse()
+            ncUnreadActive = true
+            gptFlashActive = false
+            try MagOffPaths.requestFlash()
         } catch {
             presentError(error)
         }
+    }
+
+    @objc private func clearUnreadAmber(_ sender: Any?) {
+        ncUnreadActive = false
+        gptFlashActive = false
+        triggerRestore()
     }
 
     @objc private func uninstallHelper(_ sender: Any?) {
